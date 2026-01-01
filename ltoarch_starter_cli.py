@@ -427,12 +427,6 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     """,
                     (asset_id, rel, fi.size, fi.mtime),
                 )
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(asset_id) DO NOTHING
-                """,
-                (asset_id, name, total_bytes, None, None, STATE_READY_TO_BUILD, now),
-            )
-
     print("Scan complete. Assets and files recorded. Run plan to create bundles.")
 
 
@@ -1047,7 +1041,7 @@ def main(argv=None):
     sp.add_argument("--plans-dir", default=DEFAULT_PLANS_DIR)
     sp.set_defaults(func=cmd_tapeplan)
 
-sp = sub.add_parser("stage", help="materialize per-tape staging dir with symlinks")
+    sp = sub.add_parser("stage", help="materialize per-tape staging dir with symlinks")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--tape", required=True, help="tape barcode, e.g., TAPE001")
     sp.add_argument("--staging", required=True, help="staging root, e.g., /staging")
