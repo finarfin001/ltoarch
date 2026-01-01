@@ -186,7 +186,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, str, str], List[FileInfo]]:
     """
-    Universal scanner for libraries with layouts like:
+    Universal scanner for layouts like:
       <root>/<title>/<scope>/... files ...
       <root>/<title>/... files ...
 
@@ -194,66 +194,159 @@ def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, st
       topic   = library label (from --library)
       title   = first-level directory under root
       session = second-level directory under title if present (generic "scope"), else "root"
-      stem    = media file stem
+      stem    = media file stem (or "__unmatched_sidecars" for per-scope leftover metadata)
 
-    Sidecars: any files sharing the same stem within the same session/scope directory tree.
+    Sidecars association:
+      - Tier 1: exact stem match (non-media files)
+      - Tier 2: episode tag match in filename (SxxEyy, SxxEyy-Ezz, or 3x09) (non-media files)
+      - Tier 3: any remaining non-media files in the scope become a special asset "__unmatched_sidecars"
+
+    This keeps restore simple: restoring a scope folder restores its episodes + any leftover metadata.
     """
     root = root.resolve()
     assets: Dict[Tuple[str, str, str, str], List[FileInfo]] = defaultdict(list)
 
-    # Collect all media files anywhere under root
-    media_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
+    ep_re = re.compile(r"(?i)\bS(\d{1,2})E(\d{1,2})(?:\s*-\s*E(\d{1,2}))?\b")
+    x_re = re.compile(r"(?i)\b(\d{1,2})x(\d{1,2})\b")
 
-    # Group media files by (title_dir, session_dir, stem)
-    groups: Dict[Tuple[Path, Path, str], List[Path]] = defaultdict(list)
+    def episode_keys_from_name(name: str) -> List[str]:
+        """Return normalized episode keys found in a filename, e.g. ['S07E03'] or ['S07E25','S07E26']."""
+        keys: List[str] = []
+        for m in ep_re.finditer(name):
+            s = int(m.group(1))
+            e1 = int(m.group(2))
+            e2 = int(m.group(3)) if m.group(3) is not None else None
+            keys.append(f"S{s:02d}E{e1:02d}")
+            if e2 is not None:
+                keys.append(f"S{s:02d}E{e2:02d}")
+        for m in x_re.finditer(name):
+            s = int(m.group(1))
+            e = int(m.group(2))
+            keys.append(f"S{s:02d}E{e:02d}")
+        # de-dup while preserving order
+        seen = set()
+        out = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
 
-    for mf in media_files:
-        try:
-            rel = mf.relative_to(root)
-        except ValueError:
-            continue
+    def iter_scopes(title_dir: Path) -> List[Tuple[str, Path]]:
+        """
+        Return list of (session_name, session_dir) scopes for a title.
+        - 'root' scope is the title_dir itself (only if it contains media directly)
+        - each subdirectory under title_dir is a scope (if it contains any media in its subtree)
+        """
+        scopes: List[Tuple[str, Path]] = []
 
-        parts = rel.parts
-        if len(parts) < 2:
-            # media file directly under root — ignore
-            continue
+        # root scope: if any media exists directly under title_dir subtree WITHOUT entering a subdir?
+        # Simpler: if any media file exists anywhere under title_dir, root scope doesn't automatically apply.
+        # We'll apply root scope only for media files whose relative path is <title>/<file>.
+        # That will be handled below, so here we list candidate subdirs only.
+        for sub in sorted([p for p in title_dir.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+            scopes.append((sub.name, sub))
 
-        title = parts[0]
-        title_dir = root / title
+        # Also consider root as a scope; we'll only use it if there are media files directly in title_dir.
+        scopes.append(("root", title_dir))
 
-        # Generic scope detection:
-        # If there is a second path component, treat it as "session/scope".
-        # Otherwise, session = root.
-        if len(parts) >= 3:
-            session = parts[1]
-            session_dir = title_dir / session
-        else:
-            session = "root"
-            session_dir = title_dir
+        return scopes
 
-        groups[(title_dir, session_dir, mf.stem)].append(mf)
-
-    # For each group, collect all files with same stem under that session_dir subtree
-    for (title_dir, session_dir, stem), _ in groups.items():
-        topic = library
+    # Build per-title scopes from filesystem
+    title_dirs = [p for p in root.iterdir() if p.is_dir()]
+    for title_dir in sorted(title_dirs, key=lambda p: p.name.lower()):
         title = title_dir.name
-        session = session_dir.name if session_dir != title_dir else "root"
+        for session, session_dir in iter_scopes(title_dir):
+            # Collect media files belonging to THIS scope:
+            # - for session != 'root': any media under that subdir
+            # - for session == 'root': only media directly in title_dir (no subfolders)
+            if session == "root":
+                media_files = [p for p in title_dir.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
+            else:
+                media_files = [p for p in session_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
 
-        file_paths = [p for p in session_dir.rglob("*") if p.is_file() and p.stem == stem]
-
-        lst: List[FileInfo] = []
-        for p in file_paths:
-            try:
-                st = p.stat()
-            except FileNotFoundError:
+            if not media_files:
                 continue
-            lst.append(FileInfo(path=p, size=st.st_size, mtime=int(st.st_mtime)))
 
-        if lst:
-            assets[(topic, title, session, stem)] = lst
+            # Collect all non-media files in this scope subtree (candidates for sidecars/unmatched)
+            if session == "root":
+                non_media_files = [p for p in title_dir.iterdir() if p.is_file() and p.suffix.lower() not in MEDIA_EXTS]
+            else:
+                non_media_files = [p for p in session_dir.rglob("*") if p.is_file() and p.suffix.lower() not in MEDIA_EXTS]
+
+            # Index non-media by episode keys (from filename)
+            ep_index: Dict[str, List[Path]] = defaultdict(list)
+            for nm in non_media_files:
+                for k in episode_keys_from_name(nm.name):
+                    ep_index[k].append(nm)
+
+            claimed_sidecars: set[Path] = set()
+
+            # For fast exact-stem matching, map stem -> files (non-media)
+            stem_index: Dict[str, List[Path]] = defaultdict(list)
+            for nm in non_media_files:
+                stem_index[nm.stem].append(nm)
+
+            # Create an asset per media file
+            for mf in sorted(media_files, key=lambda p: p.name.lower()):
+                topic = library
+                stem = mf.stem
+
+                # Sidecars: exact stem + episode tag matches
+                sidecars: List[Path] = []
+
+                # Tier 1: exact stem match (non-media)
+                sidecars.extend(stem_index.get(stem, []))
+
+                # Tier 2: episode tag match
+                mf_keys = episode_keys_from_name(mf.name)
+                for k in mf_keys:
+                    sidecars.extend(ep_index.get(k, []))
+
+                # De-dup sidecars, exclude the media file if it somehow appears (it shouldn't)
+                sc_seen = set()
+                sidecars_unique: List[Path] = []
+                for p in sidecars:
+                    if p == mf:
+                        continue
+                    if p not in sc_seen:
+                        sc_seen.add(p)
+                        sidecars_unique.append(p)
+
+                # Track claimed sidecars
+                for sc in sidecars_unique:
+                    claimed_sidecars.add(sc)
+
+                # Build FileInfo list: media + sidecars
+                file_paths = [mf] + sidecars_unique
+
+                lst: List[FileInfo] = []
+                for p in file_paths:
+                    try:
+                        st = p.stat()
+                    except FileNotFoundError:
+                        continue
+                    lst.append(FileInfo(path=p, size=st.st_size, mtime=int(st.st_mtime)))
+
+                if lst:
+                    assets[(topic, title, session, stem)] = lst
+
+            # Tier 3: unmatched sidecars (non-media files not claimed by any media asset)
+            unmatched = [p for p in non_media_files if p not in claimed_sidecars]
+            if unmatched:
+                topic = library
+                stem = "__unmatched_sidecars"
+                lst: List[FileInfo] = []
+                for p in sorted(unmatched, key=lambda p: p.name.lower()):
+                    try:
+                        st = p.stat()
+                    except FileNotFoundError:
+                        continue
+                    lst.append(FileInfo(path=p, size=st.st_size, mtime=int(st.st_mtime)))
+                if lst:
+                    assets[(topic, title, session, stem)] = lst
 
     return assets
-
 
 
 def stable_content_hash(file_infos: List[FileInfo], base: Path) -> str:
