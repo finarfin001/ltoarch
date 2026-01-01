@@ -803,7 +803,6 @@ def cmd_plan(args: argparse.Namespace) -> None:
     db.commit()
     print(f"Plan complete. Created {created} bundles (max_bundle_size={args.max_bundle_size}).")
 
-
 def cmd_tapeplan(args: argparse.Namespace) -> None:
     db = connect(args.db)
     init_db(db)
@@ -814,23 +813,33 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
     if tape_capacity <= 0:
         raise SystemExit("capacity must be greater than reserve")
 
+    # Plan from PLANNED/READY_TO_BUILD/BUILT bundles using planned_bytes (fallback to actual_bytes).
     rows = db.execute(
-        "SELECT id, name, actual_bytes FROM bundles WHERE state = ?",
-        (STATE_BUILT,),
+        """
+        SELECT id, name,
+               COALESCE(planned_bytes, actual_bytes, 0) AS sz,
+               state
+        FROM bundles
+        WHERE state IN (?, ?, ?)
+        """,
+        (STATE_READY_TO_BUILD, STATE_BUILT, STATE_PLANNED),
     ).fetchall()
 
-    if not rows:
-        print("No BUILT bundles to plan. Run build first.")
-        return
-
-    items = [(r["id"], int(r["actual_bytes"])) for r in rows]
+    # Filter out zero-size bundles (shouldn't happen, but protects planning)
+    items = [(r["id"], int(r["sz"])) for r in rows if int(r["sz"] or 0) > 0]
     items.sort(key=lambda x: x[1], reverse=True)
 
-    # NOTE: this is a simple greedy fill. Good enough for initial tests.
-    # Later we can swap to real FFD bin packing.
+    if not items:
+        print("No bundles to tape-plan. Run plan first (and ensure planned_bytes is populated).")
+        return
+
+    # NOTE: simple greedy fill (first-fit-ish). Fine for now.
     tapes: List[Dict] = []
     current = {"bundles": [], "used": 0, "remaining": tape_capacity}
     for bid, sz in items:
+        if sz > tape_capacity:
+            # A single bundle is larger than a tape (should not happen if max-bundle-size <= tape capacity)
+            print(f"WARNING: bundle id={bid} size={sz} exceeds usable tape capacity={tape_capacity}.")
         if sz <= current["remaining"]:
             current["bundles"].append((bid, sz))
             current["used"] += sz
@@ -862,6 +871,9 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
             row = db.execute("SELECT id FROM tapes WHERE barcode=?", (label,)).fetchone()
             if row:
                 tape_id = row[0]
+                # Reset used_bytes for this planning run (we will re-sum below)
+                db.execute("UPDATE tapes SET capacity_bytes=?, used_bytes=?, status=?, created_at=? WHERE id=?",
+                           (capacity, 0, "PLANNING", plan_ts, tape_id))
             else:
                 db.execute(
                     "INSERT INTO tapes(barcode, generation, capacity_bytes, used_bytes, status, created_at) VALUES(?,?,?,?,?,?)",
@@ -871,8 +883,9 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
 
             order_index = 0
             for bid, sz in tp["bundles"]:
+                # Mark bundle as PLANNED (only if not already BUILT/WRITTEN later)
                 rowb = db.execute("SELECT state FROM bundles WHERE id=?", (bid,)).fetchone()
-                if not (rowb and rowb[0] == STATE_PLANNED):
+                if rowb and rowb[0] in (STATE_READY_TO_BUILD, STATE_PLANNED):
                     db.execute("UPDATE bundles SET state=? WHERE id=?", (STATE_PLANNED, bid))
 
                 db.execute(
@@ -880,6 +893,9 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
                     (bid, tape_id, order_index),
                 )
                 order_index += 1
+
+            # Update tape used_bytes
+            db.execute("UPDATE tapes SET used_bytes=? WHERE id=?", (tp["used"], tape_id))
 
             snapshot["tapes"].append(
                 {
@@ -893,10 +909,9 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
             )
 
     plan_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-    print(
-        f"Planned {sum(len(t['bundles']) for t in snapshot['tapes'])} bundles across {len(snapshot['tapes'])} tapes."
-    )
+    print(f"Planned {sum(len(t['bundles']) for t in snapshot['tapes'])} bundles across {len(snapshot['tapes'])} tapes.")
     print(f"Plan snapshot: {plan_path}")
+
 
 
 # -----------------------------
