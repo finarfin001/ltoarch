@@ -498,11 +498,17 @@ def build_bundle(
     with tarfile.open(tar_part, mode="w") as tf:
         files: List[Tuple[Path, Path, int, int]] = []
         for r in rows:
-            rel_inside = Path(r["relpath"]).relative_to(
-                Path(asset["topic"]) / asset["title"] / asset["session"]
-            )
-            abs_path = root_path / Path(r["relpath"])
+            relpath = Path(r["relpath"])
+            abs_path = root_path / relpath
+
+            # store tar paths relative to the asset scope (title/session) so restore is easy
+            if asset["session"] == "root":
+                rel_inside = relpath.relative_to(Path(asset["title"]))
+            else:
+                rel_inside = relpath.relative_to(Path(asset["title"]) / asset["session"])
+
             files.append((abs_path, rel_inside, r["size"], r["mtime"]))
+
 
         # write MANIFEST.json (bundle hash filled later)
         with tempfile.TemporaryDirectory() as tmpd:
@@ -527,9 +533,12 @@ def build_bundle(
             manifest_tmp = Path(tmpd) / "MANIFEST.json"
             files2: List[Tuple[Path, Path, int, int]] = []
             for r in rows:
-                rel_inside = Path(r["relpath"]).relative_to(
-                    Path(asset["topic"]) / asset["title"] / asset["session"]
-                )
+                relpath = Path(r["relpath"])
+                if asset["session"] == "root":
+                    rel_inside = relpath.relative_to(Path(asset["title"]))
+                else:
+                    rel_inside = relpath.relative_to(Path(asset["title"]) / asset["session"])
+
                 files2.append((Path("/dev/null"), rel_inside, r["size"], r["mtime"]))
             write_manifest_json(manifest_tmp, files2, bundle_sha256=sha)
             tf.add(str(manifest_tmp), arcname="MANIFEST.json")
