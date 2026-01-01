@@ -186,25 +186,25 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, str, str], List[FileInfo]]:
     """
-    Scan media library with layouts like:
-      <root>/<show>/<files>
-      <root>/<show>/Season X/<files>
+    Universal scanner for libraries with layouts like:
+      <root>/<title>/<scope>/... files ...
+      <root>/<title>/... files ...
 
     Asset key: (topic, title, session, stem)
-      topic   = library (constant, e.g. "series_4k")
-      title   = show folder name
-      session = season folder name ("Season 1", ...) OR "root" for files directly under show folder
+      topic   = library label (from --library)
+      title   = first-level directory under root
+      session = second-level directory under title if present (generic "scope"), else "root"
       stem    = media file stem
 
-    Sidecars: any files sharing the same stem within the same session directory tree.
+    Sidecars: any files sharing the same stem within the same session/scope directory tree.
     """
     root = root.resolve()
     assets: Dict[Tuple[str, str, str, str], List[FileInfo]] = defaultdict(list)
 
-    # Collect media files anywhere under root
+    # Collect all media files anywhere under root
     media_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
 
-    # Group media files by (show_dir, session_dir, stem)
+    # Group media files by (title_dir, session_dir, stem)
     groups: Dict[Tuple[Path, Path, str], List[Path]] = defaultdict(list)
 
     for mf in media_files:
@@ -218,28 +218,27 @@ def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, st
             # media file directly under root — ignore
             continue
 
-        show = parts[0]
-        show_dir = root / show
+        title = parts[0]
+        title_dir = root / title
 
-        # Determine session_dir:
-        # - If path is <show>/Season X/... -> session = that season folder
-        # - Else session = show root
-        session_name = "root"
-        session_dir = show_dir
+        # Generic scope detection:
+        # If there is a second path component, treat it as "session/scope".
+        # Otherwise, session = root.
+        if len(parts) >= 3:
+            session = parts[1]
+            session_dir = title_dir / session
+        else:
+            session = "root"
+            session_dir = title_dir
 
-        if len(parts) >= 3 and parts[1].lower().startswith("season"):
-            session_name = parts[1]
-            session_dir = show_dir / parts[1]
+        groups[(title_dir, session_dir, mf.stem)].append(mf)
 
-        groups[(show_dir, session_dir, mf.stem)].append(mf)
-
-    # For each group, collect sidecars from within the session_dir subtree with same stem
-    for (show_dir, session_dir, stem), _media_list in groups.items():
-        title = show_dir.name
-        session = session_dir.name if session_dir != show_dir else "root"
+    # For each group, collect all files with same stem under that session_dir subtree
+    for (title_dir, session_dir, stem), _ in groups.items():
         topic = library
+        title = title_dir.name
+        session = session_dir.name if session_dir != title_dir else "root"
 
-        # Collect any file under session_dir that has same stem (includes the media file + subtitles + nfo, etc.)
         file_paths = [p for p in session_dir.rglob("*") if p.is_file() and p.stem == stem]
 
         lst: List[FileInfo] = []
