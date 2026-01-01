@@ -546,43 +546,68 @@ def build_bundle(
 
     return (bundle_id, tar_final, size, sha)
 
-
 def cmd_build(args: argparse.Namespace) -> None:
-    db = connect(args.db)
-    init_db(db)
-
     staging_root = Path(args.staging).resolve()
     staging_root.mkdir(parents=True, exist_ok=True)
 
-    rows = db.execute(
-        "SELECT * FROM bundles WHERE state IN (?, ?)",
-        (STATE_READY_TO_BUILD, STATE_BUILDING),
-    ).fetchall()
+    # Main thread connection only for listing bundle IDs
+    db = connect(args.db)
+    init_db(db)
 
-    if not rows:
+    bundle_ids = [
+        r["id"]
+        for r in db.execute(
+            "SELECT id FROM bundles WHERE state IN (?, ?)",
+            (STATE_READY_TO_BUILD, STATE_BUILDING),
+        ).fetchall()
+    ]
+
+    if not bundle_ids:
         print("No bundles to build.")
         return
 
-    print(f"Building {len(rows)} bundles to {staging_root} with {args.parallel} workers...")
+    print(f"Building {len(bundle_ids)} bundles to {staging_root} with {args.parallel} workers...")
+
     built = 0
     lock = threading.Lock()
 
-    def worker(row):
+    def worker(bundle_id: int) -> None:
         nonlocal built
+        db_local = connect(args.db)
         try:
-            res = build_bundle(db, row, staging_root)
+            init_db(db_local)
+
+            # Re-fetch the row in this thread/connection
+            row = db_local.execute("SELECT * FROM bundles WHERE id=?", (bundle_id,)).fetchone()
+            if row is None:
+                print(f"WARNING: bundle id={bundle_id} not found")
+                return
+
+            res = build_bundle(db_local, row, staging_root)
+
             with lock:
                 built += 1
                 print(
                     f"Built bundle id={res[0]} -> {res[1].name} size={res[2]} sha256={res[3][:12]}..."
                 )
         except Exception as e:
-            print(f"ERROR building bundle id={row['id']}: {e}")
+            print(f"ERROR building bundle id={bundle_id}: {e}")
+        finally:
+            try:
+                db_local.close()
+            except Exception:
+                pass
 
-    with futures.ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        list(ex.map(worker, rows))
+    # IMPORTANT: if parallel <= 1, do not use ThreadPoolExecutor at all
+    if args.parallel <= 1:
+        for bid in bundle_ids:
+            worker(bid)
+    else:
+        with futures.ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            list(ex.map(worker, bundle_ids))
 
-    print(f"Build complete: {built}/{len(rows)} bundles.")
+    print(f"Build complete: {built}/{len(bundle_ids)} bundles.")
+
 
 
 # -----------------------------
