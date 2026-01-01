@@ -270,7 +270,7 @@ def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, st
 
             # Collect all non-media files in this scope subtree (candidates for sidecars/unmatched)
             if session == "root":
-                non_media_files = [p for p in title_dir.iterdir() if p.is_file() and p.suffix.lower() not in MEDIA_EXTS]
+                non_media_files = [p for p in title_dir.rglob("*") if p.is_file() and p.suffix.lower() not in MEDIA_EXTS]
             else:
                 non_media_files = [p for p in session_dir.rglob("*") if p.is_file() and p.suffix.lower() not in MEDIA_EXTS]
 
