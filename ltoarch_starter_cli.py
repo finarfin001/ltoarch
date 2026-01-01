@@ -184,53 +184,77 @@ def init_db(conn: sqlite3.Connection) -> None:
 # Scan: discover assets by stem inside session directories
 # -----------------------------
 
-def iter_session_dirs(root: Path) -> Iterable[Path]:
-    # Expect /root/<topic>/<title>/<session>/ (accept deeper nesting under session)
-    for topic_dir in (p for p in root.iterdir() if p.is_dir()):
-        for title_dir in (p for p in topic_dir.iterdir() if p.is_dir()):
-            for session_dir in (p for p in title_dir.iterdir() if p.is_dir()):
-                yield session_dir
-
-
-def scan_assets(root: Path) -> Dict[Tuple[str, str, str, str], List[FileInfo]]:
+def scan_assets(root: Path, library: str = "library") -> Dict[Tuple[str, str, str, str], List[FileInfo]]:
     """
-    Group files into assets by stem within each session directory.
+    Scan media library with layouts like:
+      <root>/<show>/<files>
+      <root>/<show>/Season X/<files>
+
     Asset key: (topic, title, session, stem)
+      topic   = library (constant, e.g. "series_4k")
+      title   = show folder name
+      session = season folder name ("Season 1", ...) OR "root" for files directly under show folder
+      stem    = media file stem
 
-    Detection:
-    - We consider a stem an asset only if there is at least one media file with that stem.
-    - Sidecars are any other files sharing that same stem within the session tree.
+    Sidecars: any files sharing the same stem within the same session directory tree.
     """
+    root = root.resolve()
     assets: Dict[Tuple[str, str, str, str], List[FileInfo]] = defaultdict(list)
-    for session_dir in iter_session_dirs(root):
+
+    # Collect media files anywhere under root
+    media_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
+
+    # Group media files by (show_dir, session_dir, stem)
+    groups: Dict[Tuple[Path, Path, str], List[Path]] = defaultdict(list)
+
+    for mf in media_files:
         try:
-            topic = session_dir.parents[1].name
-            title = session_dir.parents[0].name
-            session = session_dir.name
-        except Exception:
+            rel = mf.relative_to(root)
+        except ValueError:
             continue
 
-        files = [p for p in session_dir.rglob("*") if p.is_file()]
-        stems_media = set()
-        by_stem: Dict[str, List[Path]] = defaultdict(list)
+        parts = rel.parts
+        if len(parts) < 2:
+            # media file directly under root — ignore
+            continue
 
-        for p in files:
-            by_stem[p.stem].append(p)
-            if p.suffix.lower() in MEDIA_EXTS:
-                stems_media.add(p.stem)
+        show = parts[0]
+        show_dir = root / show
 
-        for stem in sorted(stems_media):
-            lst: List[FileInfo] = []
-            for p in by_stem.get(stem, []):
-                try:
-                    st = p.stat()
-                except FileNotFoundError:
-                    continue
-                lst.append(FileInfo(path=p, size=st.st_size, mtime=int(st.st_mtime)))
-            if lst:
-                assets[(topic, title, session, stem)] = lst
+        # Determine session_dir:
+        # - If path is <show>/Season X/... -> session = that season folder
+        # - Else session = show root
+        session_name = "root"
+        session_dir = show_dir
+
+        if len(parts) >= 3 and parts[1].lower().startswith("season"):
+            session_name = parts[1]
+            session_dir = show_dir / parts[1]
+
+        groups[(show_dir, session_dir, mf.stem)].append(mf)
+
+    # For each group, collect sidecars from within the session_dir subtree with same stem
+    for (show_dir, session_dir, stem), _media_list in groups.items():
+        title = show_dir.name
+        session = session_dir.name if session_dir != show_dir else "root"
+        topic = library
+
+        # Collect any file under session_dir that has same stem (includes the media file + subtitles + nfo, etc.)
+        file_paths = [p for p in session_dir.rglob("*") if p.is_file() and p.stem == stem]
+
+        lst: List[FileInfo] = []
+        for p in file_paths:
+            try:
+                st = p.stat()
+            except FileNotFoundError:
+                continue
+            lst.append(FileInfo(path=p, size=st.st_size, mtime=int(st.st_mtime)))
+
+        if lst:
+            assets[(topic, title, session, stem)] = lst
 
     return assets
+
 
 
 def stable_content_hash(file_infos: List[FileInfo], base: Path) -> str:
@@ -254,7 +278,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    assets = scan_assets(root)
+    assets = scan_assets(root, library=args.library)
     print(f"Discovered {len(assets)} assets under {root}")
 
     with db:
@@ -685,6 +709,7 @@ def main(argv=None):
 
     sp = sub.add_parser("scan", help="discover assets under root")
     sp.add_argument("--root", required=True)
+    sp.add_argument("--library", default="library", help="logical library/topic name stored in DB")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.set_defaults(func=cmd_scan)
 
