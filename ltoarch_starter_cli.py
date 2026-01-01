@@ -126,8 +126,11 @@ CREATE TABLE IF NOT EXISTS asset_files (
 
 CREATE TABLE IF NOT EXISTS bundles (
   id INTEGER PRIMARY KEY,
-  asset_id INTEGER UNIQUE,
-  name TEXT,
+  topic TEXT,
+  title TEXT,
+  session TEXT,              -- NULL for whole-show bundles; otherwise scope name
+  part INTEGER DEFAULT 0,    -- 0 means not split; 1..N for parts
+  name TEXT UNIQUE,          -- tar filename within staging/<topic>/<title>/
   planned_bytes INTEGER,
   actual_bytes INTEGER,
   sha256 TEXT,
@@ -135,9 +138,20 @@ CREATE TABLE IF NOT EXISTS bundles (
   staging_path TEXT,
   ltfs_path TEXT,
   created_at TEXT,
-  completed_at TEXT,
-  FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+  completed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS bundle_assets (
+  bundle_id INTEGER NOT NULL,
+  asset_id  INTEGER NOT NULL,
+  ord       INTEGER NOT NULL,
+  PRIMARY KEY(bundle_id, asset_id),
+  FOREIGN KEY(bundle_id) REFERENCES bundles(id) ON DELETE CASCADE,
+  FOREIGN KEY(asset_id)  REFERENCES assets(id)  ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_assets_bundle ON bundle_assets(bundle_id);
+CREATE INDEX IF NOT EXISTS idx_bundle_assets_asset  ON bundle_assets(asset_id);
+
 
 CREATE TABLE IF NOT EXISTS tape_writes (
   bundle_id INTEGER UNIQUE,
@@ -170,7 +184,7 @@ class FileInfo:
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -413,18 +427,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     """,
                     (asset_id, rel, fi.size, fi.mtime),
                 )
-
-            name = f"{stem}.bundle.tar"
-            db.execute(
-                """
-                INSERT INTO bundles(asset_id, name, planned_bytes, actual_bytes, sha256, state, created_at)
                 VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(asset_id) DO NOTHING
                 """,
                 (asset_id, name, total_bytes, None, None, STATE_READY_TO_BUILD, now),
             )
 
-    print("Scan complete. Assets and initial bundle rows recorded.")
+    print("Scan complete. Assets and files recorded. Run plan to create bundles.")
 
 
 # -----------------------------
@@ -458,8 +467,7 @@ def write_manifest_json(
 def build_bundle(
     db: sqlite3.Connection, bundle_row: sqlite3.Row, staging_root: Path
 ) -> Tuple[int, Path, int, str]:
-    bundle_id = bundle_row["id"]
-    asset_id = bundle_row["asset_id"]
+    bundle_id = int(bundle_row["id"])
     name = bundle_row["name"]
 
     # Claim build (idempotent lock): only READY_TO_BUILD can move to BUILDING
@@ -468,14 +476,33 @@ def build_bundle(
         (STATE_BUILDING, bundle_id, STATE_READY_TO_BUILD),
     )
     if cur.rowcount == 0:
+        # Already built (or being built). Return what we know.
         path = Path(bundle_row["staging_path"]) if bundle_row["staging_path"] else Path("")
         return (bundle_id, path, int(bundle_row["actual_bytes"] or 0), bundle_row["sha256"] or "")
 
-    asset = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
-    root_path = Path(asset["root_path"]).resolve()
-    rows = db.execute("SELECT relpath, size, mtime FROM asset_files WHERE asset_id=?", (asset_id,)).fetchall()
+    # Re-fetch bundle (we may have modified it)
+    bundle = db.execute("SELECT * FROM bundles WHERE id=?", (bundle_id,)).fetchone()
+    if not bundle:
+        raise RuntimeError(f"bundle id={bundle_id} disappeared")
 
-    stage_dir = Path(staging_root) / f"{asset['topic']}" / f"{asset['title']}"
+    topic = bundle["topic"]
+    title = bundle["title"]
+
+    # Find assets assigned to this bundle, in deterministic order
+    asset_rows = db.execute(
+        """
+        SELECT a.*
+        FROM bundle_assets ba
+        JOIN assets a ON a.id = ba.asset_id
+        WHERE ba.bundle_id=?
+        ORDER BY ba.ord
+        """,
+        (bundle_id,),
+    ).fetchall()
+    if not asset_rows:
+        raise RuntimeError(f"bundle id={bundle_id} has no assets assigned (run plan?)")
+
+    stage_dir = Path(staging_root) / f"{topic}" / f"{title}"
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     tar_final = stage_dir / name
@@ -497,18 +524,20 @@ def build_bundle(
     # Build tar into .part then rename to final (atomic-ish)
     with tarfile.open(tar_part, mode="w") as tf:
         files: List[Tuple[Path, Path, int, int]] = []
-        for r in rows:
-            relpath = Path(r["relpath"])
-            abs_path = root_path / relpath
 
-            # store tar paths relative to the asset scope (title/session) so restore is easy
-            if asset["session"] == "root":
-                rel_inside = relpath.relative_to(Path(asset["title"]))
-            else:
-                rel_inside = relpath.relative_to(Path(asset["title"]) / asset["session"])
+        # Expand file list from all assets in this bundle
+        for asset in asset_rows:
+            root_path = Path(asset["root_path"]).resolve()
+            rows = db.execute(
+                "SELECT relpath, size, mtime FROM asset_files WHERE asset_id=? ORDER BY relpath",
+                (asset["id"],),
+            ).fetchall()
 
-            files.append((abs_path, rel_inside, r["size"], r["mtime"]))
-
+            for r in rows:
+                relpath = Path(r["relpath"])           # relpath is relative to scan root
+                abs_path = root_path / relpath          # absolute source path on disk
+                rel_inside = relpath                    # store full relpath in the tar for self-reconstructing restore
+                files.append((abs_path, rel_inside, int(r["size"]), int(r["mtime"])))
 
         # write MANIFEST.json (bundle hash filled later)
         with tempfile.TemporaryDirectory() as tmpd:
@@ -532,14 +561,8 @@ def build_bundle(
         with tempfile.TemporaryDirectory() as tmpd:
             manifest_tmp = Path(tmpd) / "MANIFEST.json"
             files2: List[Tuple[Path, Path, int, int]] = []
-            for r in rows:
-                relpath = Path(r["relpath"])
-                if asset["session"] == "root":
-                    rel_inside = relpath.relative_to(Path(asset["title"]))
-                else:
-                    rel_inside = relpath.relative_to(Path(asset["title"]) / asset["session"])
-
-                files2.append((Path("/dev/null"), rel_inside, r["size"], r["mtime"]))
+            for abs_path, rel, sz, mt in files:
+                files2.append((Path("/dev/null"), rel, sz, mt))
             write_manifest_json(manifest_tmp, files2, bundle_sha256=sha)
             tf.add(str(manifest_tmp), arcname="MANIFEST.json")
 
@@ -554,6 +577,7 @@ def build_bundle(
         )
 
     return (bundle_id, tar_final, size, sha)
+
 
 def cmd_build(args: argparse.Namespace) -> None:
     staging_root = Path(args.staging).resolve()
@@ -623,7 +647,170 @@ def cmd_build(args: argparse.Namespace) -> None:
 # Plan: pack BUILT bundles to tapes (greedy, largest-first)
 # -----------------------------
 
+
+# -----------------------------
+# Plan: build bundles dynamically (show/session/split) based on max bundle size
+# -----------------------------
+
+def _safe_name(s: str) -> str:
+    # Keep it filesystem-friendly but readable
+    s = s.strip().replace(os.sep, "_")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s\-\.\(\)\[\]]+", "_", s, flags=re.UNICODE)
+    s = s.strip().replace(" ", "_")
+    return s or "unnamed"
+
+
 def cmd_plan(args: argparse.Namespace) -> None:
+    """
+    Create bundle rows + bundle_assets membership in the DB.
+
+    Policy (deterministic):
+      - For each (topic,title):
+          * If total bytes for the whole title <= max_bundle, create one whole-show bundle (session NULL).
+          * Else, for each session under that title:
+              - If session bytes <= max_bundle, create one session bundle.
+              - Else, split that session into part bundles <= max_bundle (greedy packing by descending asset size).
+    """
+    db = connect(args.db)
+    init_db(db)
+
+    max_bundle = parse_size(args.max_bundle_size)
+
+    # Safety: don't re-plan if tape_writes already exist unless forced
+    tw = db.execute("SELECT COUNT(*) FROM tape_writes").fetchone()[0]
+    if tw and not args.force:
+        raise SystemExit(
+            "Refusing to re-plan because tape_writes exist. Use --force if you really want to discard and re-plan."
+        )
+
+    # Clear previous plan (bundles + membership)
+    with db:
+        db.execute("DELETE FROM bundle_assets")
+        db.execute("DELETE FROM bundles")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    titles = db.execute(
+        """
+        SELECT topic, title, SUM(bytes) AS total_bytes
+        FROM assets
+        GROUP BY topic, title
+        ORDER BY topic, title
+        """
+    ).fetchall()
+
+    if not titles:
+        print("No assets found. Run scan first.")
+        return
+
+    created = 0
+
+    def create_bundle(topic: str, title: str, session: Optional[str], part: int, asset_ids: List[int], planned_bytes: int) -> None:
+        nonlocal created
+
+        if session is None:
+            name = "__SHOW__.bundle.tar"
+        else:
+            base = _safe_name(session)
+            if part and part > 0:
+                name = f"{base}.part{part:02d}.bundle.tar"
+            else:
+                name = f"{base}.bundle.tar"
+
+        # Ensure uniqueness within title directory
+        # (name is UNIQUE globally in table, but by putting bundles under topic/title directory it's fine)
+        db.execute(
+            """
+            INSERT INTO bundles(topic, title, session, part, name, planned_bytes, state, created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (topic, title, session, part, name, planned_bytes, STATE_READY_TO_BUILD, now),
+        )
+        bundle_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        for i, aid in enumerate(asset_ids):
+            db.execute(
+                "INSERT INTO bundle_assets(bundle_id, asset_id, ord) VALUES(?,?,?)",
+                (bundle_id, aid, i),
+            )
+
+        created += 1
+
+    # For each title, decide whole-show vs per-session
+    for row in titles:
+        topic, title, total_bytes = row["topic"], row["title"], int(row["total_bytes"] or 0)
+
+        if total_bytes <= max_bundle:
+            asset_rows = db.execute(
+                "SELECT id FROM assets WHERE topic=? AND title=? ORDER BY session, stem",
+                (topic, title),
+            ).fetchall()
+            asset_ids = [int(r["id"]) for r in asset_rows]
+            if asset_ids:
+                create_bundle(topic, title, None, 0, asset_ids, total_bytes)
+            continue
+
+        # Per-session planning
+        sessions = db.execute(
+            """
+            SELECT session, SUM(bytes) AS sess_bytes
+            FROM assets
+            WHERE topic=? AND title=?
+            GROUP BY session
+            ORDER BY session
+            """,
+            (topic, title),
+        ).fetchall()
+
+        for srow in sessions:
+            session = srow["session"]
+            sess_bytes = int(srow["sess_bytes"] or 0)
+
+            asset_rows = db.execute(
+                """
+                SELECT id, bytes
+                FROM assets
+                WHERE topic=? AND title=? AND session=?
+                ORDER BY bytes DESC, stem
+                """,
+                (topic, title, session),
+            ).fetchall()
+
+            if not asset_rows:
+                continue
+
+            if sess_bytes <= max_bundle:
+                asset_ids = [int(r["id"]) for r in asset_rows]
+                create_bundle(topic, title, session, 0, asset_ids, sess_bytes)
+                continue
+
+            # Split session into parts (greedy by size)
+            part = 1
+            current_ids: List[int] = []
+            current_bytes = 0
+
+            for ar in asset_rows:
+                aid = int(ar["id"])
+                ab = int(ar["bytes"] or 0)
+
+                if current_ids and (current_bytes + ab) > max_bundle:
+                    create_bundle(topic, title, session, part, current_ids, current_bytes)
+                    part += 1
+                    current_ids = []
+                    current_bytes = 0
+
+                current_ids.append(aid)
+                current_bytes += ab
+
+            if current_ids:
+                create_bundle(topic, title, session, part, current_ids, current_bytes)
+
+    db.commit()
+    print(f"Plan complete. Created {created} bundles (max_bundle_size={args.max_bundle_size}).")
+
+
+def cmd_tapeplan(args: argparse.Namespace) -> None:
     db = connect(args.db)
     init_db(db)
 
@@ -739,10 +926,9 @@ def cmd_stage(args: argparse.Namespace) -> None:
     rows = db.execute(
         """
         SELECT b.id AS bundle_id, b.name, b.staging_path, b.state, b.sha256,
-               a.topic, a.title
+               b.topic, b.title, b.session
         FROM tape_writes tw
         JOIN bundles b ON b.id = tw.bundle_id
-        JOIN assets a ON a.id = b.asset_id
         WHERE tw.tape_id=?
         ORDER BY tw.order_index
         """,
@@ -773,6 +959,8 @@ def cmd_stage(args: argparse.Namespace) -> None:
 
         # For readability keep a per-topic/title subdirectory on the tape staging view
         subdir = tape_dir / r["topic"] / r["title"]
+        if r["session"]:
+            subdir = subdir / r["session"]
         subdir.mkdir(parents=True, exist_ok=True)
 
         link_tar = subdir / spath.name
@@ -839,21 +1027,27 @@ def main(argv=None):
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.set_defaults(func=cmd_scan)
 
-    sp = sub.add_parser("build", help="build per-asset bundle tars into staging")
+    sp = sub.add_parser("plan", help="plan bundles (DB-level grouping) with a max bundle size")
+    sp.add_argument("--db", default=DEFAULT_DB)
+    sp.add_argument("--max-bundle-size", default="200G", help="e.g. 200G (default), 95G, 1.5T")
+    sp.add_argument("--force", action="store_true", help="allow re-planning even if tape_writes exist (will discard prior plan)")
+    sp.set_defaults(func=cmd_plan)
+
+    sp = sub.add_parser("build", help="build planned bundle tars into staging")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--staging", required=True)
     sp.add_argument("--parallel", type=int, default=2)
     sp.set_defaults(func=cmd_build)
 
-    sp = sub.add_parser("plan", help="plan BUILT bundles onto tapes")
+    sp = sub.add_parser("tapeplan", help="plan BUILT bundles onto tapes (bin-pack)")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--capacity", required=True, help="e.g. 2.40T")
     sp.add_argument("--reserve", required=True, help="e.g. 40G")
     sp.add_argument("--tape-start", default="TAPE001")
     sp.add_argument("--plans-dir", default=DEFAULT_PLANS_DIR)
-    sp.set_defaults(func=cmd_plan)
+    sp.set_defaults(func=cmd_tapeplan)
 
-    sp = sub.add_parser("stage", help="materialize per-tape staging dir with symlinks")
+sp = sub.add_parser("stage", help="materialize per-tape staging dir with symlinks")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--tape", required=True, help="tape barcode, e.g., TAPE001")
     sp.add_argument("--staging", required=True, help="staging root, e.g., /staging")
