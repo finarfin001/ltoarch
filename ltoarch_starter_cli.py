@@ -459,28 +459,66 @@ def write_manifest_json(
 
 
 def build_bundle(
-    db: sqlite3.Connection, bundle_row: sqlite3.Row, staging_root: Path
+    db: sqlite3.Connection,
+    bundle_row: sqlite3.Row,
+    staging_root: Path,
+    rebuild: bool = False,
 ) -> Tuple[int, Path, int, str]:
     bundle_id = int(bundle_row["id"])
-    name = bundle_row["name"]
 
-    # Claim build (idempotent lock): only READY_TO_BUILD can move to BUILDING
+    # Always re-fetch bundle (fresh state/fields)
+    bundle = db.execute("SELECT * FROM bundles WHERE id=?", (bundle_id,)).fetchone()
+    if not bundle:
+        raise RuntimeError(f"bundle id={bundle_id} disappeared")
+
+    name = bundle["name"]
+    topic = bundle["topic"]
+    title = bundle["title"]
+
+    stage_dir = Path(staging_root) / f"{topic}" / f"{title}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    tar_final = stage_dir / name
+    tar_part = stage_dir / (name + ".part")
+    sha_file = stage_dir / (name + ".sha256")
+    ready_flag = stage_dir / (name + ".READY")
+
+    # If rebuild requested: remove any existing artifacts + reset DB fields
+    if rebuild:
+        for p in (tar_final, tar_part, sha_file, ready_flag):
+            try:
+                if p.exists():
+                    p.unlink()
+            except IsADirectoryError:
+                # just in case
+                pass
+
+        with db:
+            db.execute(
+                """
+                UPDATE bundles
+                   SET state=?,
+                       actual_bytes=NULL,
+                       sha256=NULL,
+                       staging_path=NULL,
+                       completed_at=NULL
+                 WHERE id=?
+                """,
+                (STATE_READY_TO_BUILD, bundle_id),
+            )
+
+        # refresh bundle after reset
+        bundle = db.execute("SELECT * FROM bundles WHERE id=?", (bundle_id,)).fetchone()
+
+    # Claim build: allow READY_TO_BUILD -> BUILDING
     cur = db.execute(
         "UPDATE bundles SET state=? WHERE id=? AND state=?",
         (STATE_BUILDING, bundle_id, STATE_READY_TO_BUILD),
     )
     if cur.rowcount == 0:
-        # Already built (or being built). Return what we know.
-        path = Path(bundle_row["staging_path"]) if bundle_row["staging_path"] else Path("")
-        return (bundle_id, path, int(bundle_row["actual_bytes"] or 0), bundle_row["sha256"] or "")
-
-    # Re-fetch bundle (we may have modified it)
-    bundle = db.execute("SELECT * FROM bundles WHERE id=?", (bundle_id,)).fetchone()
-    if not bundle:
-        raise RuntimeError(f"bundle id={bundle_id} disappeared")
-
-    topic = bundle["topic"]
-    title = bundle["title"]
+        # Already built (or being built). If rebuild was requested, we already reset above.
+        path = Path(bundle["staging_path"]) if bundle["staging_path"] else Path("")
+        return (bundle_id, path, int(bundle["actual_bytes"] or 0), bundle["sha256"] or "")
 
     # Find assets assigned to this bundle, in deterministic order
     asset_rows = db.execute(
@@ -493,18 +531,11 @@ def build_bundle(
         """,
         (bundle_id,),
     ).fetchall()
+
     if not asset_rows:
-        raise RuntimeError(f"bundle id={bundle_id} has no assets assigned (run plan?)")
+        raise RuntimeError(f"bundle id={bundle_id} has no bundle_assets")
 
-    stage_dir = Path(staging_root) / f"{topic}" / f"{title}"
-    stage_dir.mkdir(parents=True, exist_ok=True)
-
-    tar_final = stage_dir / name
-    tar_part = stage_dir / (name + ".part")
-    sha_file = stage_dir / (name + ".sha256")
-    ready_flag = stage_dir / (name + ".READY")
-
-    # If it already exists and is marked READY, just record it and finish
+    # If it already exists and is marked READY, just record it and finish (idempotency)
     if tar_final.exists() and ready_flag.exists():
         size = tar_final.stat().st_size
         sha = sha256_path(tar_final)
@@ -519,7 +550,6 @@ def build_bundle(
     with tarfile.open(tar_part, mode="w") as tf:
         files: List[Tuple[Path, Path, int, int]] = []
 
-        # Expand file list from all assets in this bundle
         for asset in asset_rows:
             root_path = Path(asset["root_path"]).resolve()
             rows = db.execute(
@@ -528,9 +558,9 @@ def build_bundle(
             ).fetchall()
 
             for r in rows:
-                relpath = Path(r["relpath"])           # relpath is relative to scan root
-                abs_path = root_path / relpath          # absolute source path on disk
-                rel_inside = relpath                    # store full relpath in the tar for self-reconstructing restore
+                relpath = Path(r["relpath"])          # relative to scan root
+                abs_path = root_path / relpath         # absolute source path
+                rel_inside = relpath                   # store full relpath for self-reconstructing restore
                 files.append((abs_path, rel_inside, int(r["size"]), int(r["mtime"])))
 
         # write MANIFEST.json (bundle hash filled later)
@@ -581,13 +611,19 @@ def cmd_build(args: argparse.Namespace) -> None:
     db = connect(args.db)
     init_db(db)
 
+    if args.rebuild:
+        states = (STATE_READY_TO_BUILD, STATE_PLANNED, STATE_BUILDING, STATE_BUILT)
+    else:
+        states = (STATE_READY_TO_BUILD, STATE_PLANNED, STATE_BUILDING)
+
     bundle_ids = [
         r["id"]
         for r in db.execute(
-            "SELECT id FROM bundles WHERE state IN (?, ?)",
-            (STATE_READY_TO_BUILD, STATE_BUILDING),
+            f"SELECT id FROM bundles WHERE state IN ({','.join('?' for _ in states)})",
+            states,
         ).fetchall()
-    ]
+]
+
 
     if not bundle_ids:
         print("No bundles to build.")
@@ -610,7 +646,7 @@ def cmd_build(args: argparse.Namespace) -> None:
                 print(f"WARNING: bundle id={bundle_id} not found")
                 return
 
-            res = build_bundle(db_local, row, staging_root)
+            res = build_bundle(db_local, row, staging_root, rebuild=bool(args.rebuild))
 
             with lock:
                 built += 1
@@ -1061,6 +1097,12 @@ def main(argv=None):
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--staging", required=True)
     sp.add_argument("--parallel", type=int, default=2)
+    sp.add_argument(
+    "--rebuild",
+    action="store_true",
+    help="Delete any existing staged tar/READY/sha256 for eligible bundles and rebuild them.",
+    )
+
     sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("tapeplan", help="plan bundles onto tapes (DB-only bin-pack)")
