@@ -813,32 +813,40 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
     if tape_capacity <= 0:
         raise SystemExit("capacity must be greater than reserve")
 
-    # Plan from PLANNED/READY_TO_BUILD/BUILT bundles using planned_bytes (fallback to actual_bytes).
+    # Which bundle states are eligible?
+    # - default: include READY_TO_BUILD + PLANNED + BUILT (useful for mixed scenarios)
+    # - --only-ready: include only not-built bundles (READY_TO_BUILD + PLANNED)
+    if args.only_ready:
+        eligible_states = (STATE_READY_TO_BUILD, STATE_PLANNED)
+    else:
+        eligible_states = (STATE_READY_TO_BUILD, STATE_PLANNED, STATE_BUILT)
+
     rows = db.execute(
-        """
+        f"""
         SELECT id, name,
                COALESCE(planned_bytes, actual_bytes, 0) AS sz,
                state
         FROM bundles
-        WHERE state IN (?, ?, ?)
+        WHERE state IN ({",".join("?" for _ in eligible_states)})
         """,
-        (STATE_READY_TO_BUILD, STATE_BUILT, STATE_PLANNED),
+        eligible_states,
     ).fetchall()
 
-    # Filter out zero-size bundles (shouldn't happen, but protects planning)
-    items = [(r["id"], int(r["sz"])) for r in rows if int(r["sz"] or 0) > 0]
+    items = [(int(r["id"]), int(r["sz"] or 0)) for r in rows if int(r["sz"] or 0) > 0]
     items.sort(key=lambda x: x[1], reverse=True)
 
     if not items:
-        print("No bundles to tape-plan. Run plan first (and ensure planned_bytes is populated).")
+        if args.only_ready:
+            print("No READY/PLANNED (not-built) bundles to tape-plan. Run plan first.")
+        else:
+            print("No bundles to tape-plan. Run plan first.")
         return
 
-    # NOTE: simple greedy fill (first-fit-ish). Fine for now.
+    # Greedy fill (largest-first). Good enough for initial tests.
     tapes: List[Dict] = []
     current = {"bundles": [], "used": 0, "remaining": tape_capacity}
     for bid, sz in items:
         if sz > tape_capacity:
-            # A single bundle is larger than a tape (should not happen if max-bundle-size <= tape capacity)
             print(f"WARNING: bundle id={bid} size={sz} exceeds usable tape capacity={tape_capacity}.")
         if sz <= current["remaining"]:
             current["bundles"].append((bid, sz))
@@ -850,12 +858,15 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
     if current["bundles"]:
         tapes.append(current)
 
+    # Compute tape labels we will touch this run
     start_label = args.tape_start
     m = re.match(r"^(.*?)(\d+)$", start_label)
     if m:
         prefix, num = m.group(1), int(m.group(2))
     else:
         prefix, num = (start_label, 1)
+
+    labels = [f"{prefix}{num + ti:03d}" for ti in range(len(tapes))]
 
     plan_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     plans_dir = Path(args.plans_dir or DEFAULT_PLANS_DIR)
@@ -866,24 +877,30 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
 
     with db:
         for ti, tp in enumerate(tapes):
-            label = f"{prefix}{num + ti:03d}"
+            label = labels[ti]
 
             row = db.execute("SELECT id FROM tapes WHERE barcode=?", (label,)).fetchone()
             if row:
-                tape_id = row[0]
-                # Reset used_bytes for this planning run (we will re-sum below)
-                db.execute("UPDATE tapes SET capacity_bytes=?, used_bytes=?, status=?, created_at=? WHERE id=?",
-                           (capacity, 0, "PLANNING", plan_ts, tape_id))
+                tape_id = int(row[0])
             else:
                 db.execute(
                     "INSERT INTO tapes(barcode, generation, capacity_bytes, used_bytes, status, created_at) VALUES(?,?,?,?,?,?)",
                     (label, 6, capacity, 0, "PLANNING", plan_ts),
                 )
-                tape_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                tape_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
 
+            # Option: wipe existing assignments for these tape labels
+            if args.wipe_existing:
+                db.execute("DELETE FROM tape_writes WHERE tape_id=?", (tape_id,))
+                db.execute(
+                    "UPDATE tapes SET capacity_bytes=?, used_bytes=?, status=?, created_at=? WHERE id=?",
+                    (capacity, 0, "PLANNING", plan_ts, tape_id),
+                )
+
+            # Assign bundles (bundle_id UNIQUE in tape_writes -> moves bundles if re-planned)
             order_index = 0
             for bid, sz in tp["bundles"]:
-                # Mark bundle as PLANNED (only if not already BUILT/WRITTEN later)
+                # Mark not-built bundles as PLANNED
                 rowb = db.execute("SELECT state FROM bundles WHERE id=?", (bid,)).fetchone()
                 if rowb and rowb[0] in (STATE_READY_TO_BUILD, STATE_PLANNED):
                     db.execute("UPDATE bundles SET state=? WHERE id=?", (STATE_PLANNED, bid))
@@ -894,16 +911,15 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
                 )
                 order_index += 1
 
-            # Update tape used_bytes
-            db.execute("UPDATE tapes SET used_bytes=? WHERE id=?", (tp["used"], tape_id))
+            db.execute("UPDATE tapes SET used_bytes=? WHERE id=?", (int(tp["used"]), tape_id))
 
             snapshot["tapes"].append(
                 {
                     "barcode": label,
                     "capacity_bytes": capacity,
                     "reserve_bytes": reserve,
-                    "used_bytes": tp["used"],
-                    "remaining_bytes": tp["remaining"],
+                    "used_bytes": int(tp["used"]),
+                    "remaining_bytes": int(tp["remaining"]),
                     "bundles": [{"bundle_id": bid, "size": sz} for bid, sz in tp["bundles"]],
                 }
             )
@@ -911,7 +927,6 @@ def cmd_tapeplan(args: argparse.Namespace) -> None:
     plan_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     print(f"Planned {sum(len(t['bundles']) for t in snapshot['tapes'])} bundles across {len(snapshot['tapes'])} tapes.")
     print(f"Plan snapshot: {plan_path}")
-
 
 
 # -----------------------------
@@ -1048,13 +1063,24 @@ def main(argv=None):
     sp.add_argument("--parallel", type=int, default=2)
     sp.set_defaults(func=cmd_build)
 
-    sp = sub.add_parser("tapeplan", help="plan BUILT bundles onto tapes (bin-pack)")
+    sp = sub.add_parser("tapeplan", help="plan bundles onto tapes (DB-only bin-pack)")
     sp.add_argument("--db", default=DEFAULT_DB)
     sp.add_argument("--capacity", required=True, help="e.g. 2.40T")
     sp.add_argument("--reserve", required=True, help="e.g. 40G")
     sp.add_argument("--tape-start", default="TAPE001")
     sp.add_argument("--plans-dir", default=DEFAULT_PLANS_DIR)
+    sp.add_argument(
+        "--only-ready",
+        action="store_true",
+        help="Only include not-built bundles (READY_TO_BUILD + PLANNED). Excludes BUILT bundles.",
+    )
+    sp.add_argument(
+        "--wipe-existing",
+        action="store_true",
+        help="Before planning, delete existing tape_writes for the affected tape labels (TAPE001..).",
+    )
     sp.set_defaults(func=cmd_tapeplan)
+
 
     sp = sub.add_parser("stage", help="materialize per-tape staging dir with symlinks")
     sp.add_argument("--db", default=DEFAULT_DB)
